@@ -137,25 +137,33 @@ function exclusionReason(baseSku, variantSku, name) {
 }
 
 function loadCategoryMap() {
-  const rows = queryAll("SELECT DISTINCT filter_id, broad_category FROM category_map ORDER BY broad_category");
-  CATEGORY_GROUPS = rows;
+  try {
+    CATEGORY_GROUPS = queryAll("SELECT DISTINCT filter_id, broad_category FROM category_map ORDER BY broad_category");
+  } catch (e) {
+    console.warn("category_mapテーブルが見つかりません(古いDBファイルの可能性)。カテゴリ絞り込みは無効化されます。", e);
+    CATEGORY_GROUPS = [];
+  }
 }
 
 function computeAllStatuses() {
+  const categoryMapExists = queryAll(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='category_map'"
+  ).length > 0;
+
   const rows = queryAll(`
     SELECT v.variant_sku, v.base_sku, v.our_sku, v.dimension_path, v.color_name,
            v.cost_jpy, v.stock_status, v.stock_level, v.last_seen_at,
            p.name, p.english_name, p.url AS costco_url, p.price_jpy, p.discount_value,
            p.discount_start_date, p.discount_end_date, p.average_rating, p.number_of_reviews,
-           p.description, p.summary, p.primary_image_url, p.category_code,
-           cm.filter_id AS category_filter_id, cm.broad_category AS category_name,
+           p.description, p.summary, p.primary_image_url,
+           ${categoryMapExists ? "p.category_code, cm.filter_id AS category_filter_id, cm.broad_category AS category_name," : "NULL AS category_code, NULL AS category_filter_id, NULL AS category_name,"}
            r.variant_sku AS rakuten_variant_sku, r.our_sku AS rakuten_product_id,
            r.sku_code, r.product_url AS rakuten_url, r.price_jpy AS rakuten_price,
            r.stock_count AS rakuten_stock, r.updated_at AS rakuten_updated
     FROM variants v
     JOIN products p ON p.base_sku = v.base_sku
     LEFT JOIN rakuten_listing r ON r.variant_sku = v.variant_sku
-    LEFT JOIN category_map cm ON cm.category_code = p.category_code
+    ${categoryMapExists ? "LEFT JOIN category_map cm ON cm.category_code = p.category_code" : ""}
   `);
 
   // base_sku ごとの出現回数を数えて「バリエーション商品」判定に使う
