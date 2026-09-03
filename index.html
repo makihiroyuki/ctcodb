@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CTCO DB</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-neutral-100 text-neutral-900 min-h-screen">
+<div id="app" class="p-4 max-w-5xl mx-auto">
+  <p class="text-neutral-500">読み込み中...</p>
+</div>
+
+<script>
+// ------------------------------------------------------------------
+// 設定: ctco_view.db.gz を index.html と同じ場所に置いておけばそのまま読み込む。
+// 別の場所に置きたい場合だけ ?file=... でファイル名/パスを上書きできる。
+// ------------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+const FILE_NAME = params.get("file") || "ctco_view.db.gz";
+
+const STATUS_STYLE = {
+  "出品中": "bg-white border border-neutral-300 text-neutral-900",
+  "在庫0": "bg-neutral-300 text-neutral-900",
+  "未出品(出品可)": "bg-neutral-900 text-neutral-100",
+  "出品除外商品": "bg-red-900 text-red-100",
+};
+
+let DB = null;
+let KEYWORDS = [];
+let SKU_REASONS = {};
+let ALL_ROWS = [];
+
+const app = document.getElementById("app");
+
+function setMessage(html) {
+  app.innerHTML = `<div class="text-neutral-500 py-10 text-center">${html}</div>`;
+}
+
+async function main() {
+  try {
+    setMessage("データを読み込み中...");
+    const bytes = await fetchDbBytes();
+
+    setMessage("データベースを読み込み中...");
+    const SQL = await initSqlJs({
+      locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${f}`
+    });
+    DB = new SQL.Database(bytes);
+
+    loadExclusions();
+    ALL_ROWS = computeAllStatuses();
+
+    handleRoute();
+    window.addEventListener("hashchange", handleRoute);
+  } catch (e) {
+    console.error(e);
+    setMessage(`読み込みに失敗しました: ${e.message}`);
+  }
+}
+
+async function fetchDbBytes() {
+  const res = await fetch(FILE_NAME, { cache: "no-store" });
+  if (!res.ok) throw new Error(`${FILE_NAME} の取得に失敗しました(${res.status})。index.htmlと同じ場所に置かれているか確認してください。`);
+  const buf = await res.arrayBuffer();
+
+  if (FILE_NAME.endsWith(".gz")) {
+    return pako.inflate(new Uint8Array(buf));
+  }
+  return new Uint8Array(buf);
+}
+
+function queryAll(sql) {
+  const res = DB.exec(sql);
+  if (res.length === 0) return [];
+  const { columns, values } = res[0];
+  return values.map(row => Object.fromEntries(columns.map((c, i) => [c, row[i]])));
+}
+
+function loadExclusions() {
+  KEYWORDS = queryAll("SELECT keyword, reason FROM exclusion_keywords").map(r => r.keyword).filter(Boolean);
+  SKU_REASONS = {};
+  for (const r of queryAll("SELECT sku, reason FROM exclusion_skus")) {
+    SKU_REASONS[r.sku] = r.reason;
+  }
+}
+
+function exclusionReason(baseSku, variantSku, name) {
+  if (SKU_REASONS[baseSku]) return SKU_REASONS[baseSku];
+  if (SKU_REASONS[variantSku]) return SKU_REASONS[variantSku];
+  if (name) {
+    for (const kw of KEYWORDS) {
+      if (name.includes(kw)) return `除外キーワード「${kw}」`;
+    }
+  }
+  return null;
+}
+
+function computeAllStatuses() {
+  const rows = queryAll(`
+    SELECT v.variant_sku, v.base_sku, v.our_sku, v.dimension_path, v.color_name,
+           v.cost_jpy, v.stock_status, v.stock_level, v.last_seen_at,
+           p.name, p.english_name, p.url AS costco_url, p.price_jpy, p.discount_value,
+           p.discount_start_date, p.discount_end_date, p.average_rating, p.number_of_reviews,
+           p.description, p.summary, p.primary_image_url,
+           r.variant_sku AS rakuten_variant_sku, r.our_sku AS rakuten_product_id,
+           r.sku_code, r.product_url AS rakuten_url, r.price_jpy AS rakuten_price,
+           r.stock_count AS rakuten_stock, r.updated_at AS rakuten_updated
+    FROM variants v
+    JOIN products p ON p.base_sku = v.base_sku
+    LEFT JOIN rakuten_listing r ON r.variant_sku = v.variant_sku
+  `);
+
+  const now = new Date();
+  return rows.map(row => {
+    const reason = exclusionReason(row.base_sku, row.variant_sku, row.name);
+    const isListed = row.rakuten_variant_sku !== null && row.rakuten_variant_sku !== undefined;
+
+    let status, effectivePrice = row.price_jpy;
+    if (row.discount_value && row.discount_start_date && row.discount_end_date) {
+      const start = new Date(row.discount_start_date), end = new Date(row.discount_end_date);
+      if (now >= start && now <= end) effectivePrice = row.price_jpy - row.discount_value;
+    }
+
+    if (reason) status = "出品除外商品";
+    else if (!isListed) status = "未出品(出品可)";
+    else if ((row.rakuten_stock || 0) > 0) status = "出品中";
+    else status = "在庫0";
+
+    return { ...row, status, exclusionReason: reason, isListed, effectivePrice };
+  });
+}
+
+// ------------------------------------------------------------------
+// ルーティング(ハッシュベースのシンプルなSPA)
+// ------------------------------------------------------------------
+function handleRoute() {
+  const hash = location.hash.slice(1);
+  if (hash.startsWith("/sku/")) {
+    renderDetail(decodeURIComponent(hash.slice(5)));
+  } else {
+    renderList();
+  }
+  window.scrollTo(0, 0);
+}
+
+function renderList() {
+  const q = (document.getElementById("search-input")?.value || "").toLowerCase();
+  const statusFilter = document.getElementById("status-filter")?.value || "";
+
+  let rows = ALL_ROWS;
+  if (q) {
+    rows = rows.filter(r =>
+      (r.name || "").toLowerCase().includes(q) ||
+      r.variant_sku.toLowerCase().includes(q) ||
+      (r.our_sku || "").toLowerCase().includes(q)
+    );
+  }
+  if (statusFilter) rows = rows.filter(r => r.status === statusFilter);
+
+  const PAGE_SIZE = 60;
+  const shown = rows.slice(0, PAGE_SIZE);
+
+  app.innerHTML = `
+    <h1 class="text-xl font-bold mb-4">CTCO DB 商品一覧 (${rows.length}件 / 全${ALL_ROWS.length}件)</h1>
+    <div class="flex gap-2 mb-4">
+      <input id="search-input" type="text" placeholder="商品名 or SKU で検索"
+             class="border rounded px-3 py-2 flex-1" value="${escapeHtml(q)}">
+      <select id="status-filter" class="border rounded px-3 py-2">
+        <option value="">すべてのステータス</option>
+        ${Object.keys(STATUS_STYLE).map(s =>
+          `<option value="${s}" ${statusFilter === s ? "selected" : ""}>${s}</option>`
+        ).join("")}
+      </select>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+      ${shown.map(cardHtml).join("")}
+    </div>
+    ${rows.length > PAGE_SIZE ? `<p class="text-center text-neutral-500 mt-4">上位${PAGE_SIZE}件を表示中。検索で絞り込んでください。</p>` : ""}
+  `;
+  document.getElementById("search-input").addEventListener("input", debounce(renderList, 200));
+  document.getElementById("status-filter").addEventListener("change", renderList);
+}
+
+function cardHtml(r) {
+  return `
+    <a href="#/sku/${encodeURIComponent(r.variant_sku)}" class="block rounded-lg p-4 ${STATUS_STYLE[r.status]} hover:opacity-90">
+      <p class="font-medium text-sm mb-1">${escapeHtml(r.name || "")}</p>
+      <p class="text-xs opacity-70 mb-2">${escapeHtml(r.our_sku || "")}</p>
+      <span class="text-xs px-2 py-1 rounded bg-black/10">${r.status}</span>
+      ${r.exclusionReason ? `<p class="text-xs mt-1 opacity-80">理由: ${escapeHtml(r.exclusionReason)}</p>` : ""}
+      ${r.status === "在庫0" ? `<p class="text-xs mt-1 opacity-80">最終在庫確認日: ${r.last_seen_at || "-"}</p>` : ""}
+    </a>
+  `;
+}
+
+function renderDetail(variantSku) {
+  const r = ALL_ROWS.find(x => x.variant_sku === variantSku);
+  if (!r) { setMessage("SKUが見つかりません"); return; }
+
+  const bg = {
+    "出品中": "bg-white text-neutral-900",
+    "在庫0": "bg-neutral-300 text-neutral-900",
+    "未出品(出品可)": "bg-neutral-900 text-neutral-100",
+    "出品除外商品": "bg-red-950 text-red-100",
+  }[r.status];
+
+  app.innerHTML = `
+    <div class="${bg} rounded-lg p-6 -mx-4 sm:mx-0">
+      <a href="#/" class="text-sm opacity-70 hover:underline">← 一覧に戻る</a>
+      <div class="mt-4 flex gap-6 flex-col sm:flex-row">
+        ${r.primary_image_url ? `<img src="${r.primary_image_url}" class="w-40 h-40 object-contain bg-white rounded-lg flex-shrink-0" alt="">` : ""}
+        <div>
+          <span class="inline-block text-xs px-2 py-1 rounded bg-black/10 mb-2">${r.status}</span>
+          <h1 class="text-xl font-bold">${escapeHtml(r.name || "")}</h1>
+          <p class="opacity-70 text-sm">${escapeHtml(r.english_name || "")}</p>
+          <p class="opacity-70 text-sm mt-1">variant_sku: ${r.variant_sku} / our_sku: ${r.our_sku || "-"}</p>
+          ${r.average_rating ? `<p class="text-sm mt-1">★ ${r.average_rating}(${r.number_of_reviews}件のレビュー)</p>` : ""}
+          ${r.exclusionReason ? `<p class="text-sm mt-2 font-medium">除外理由: ${escapeHtml(r.exclusionReason)}</p>` : ""}
+          ${r.status === "在庫0" ? `<p class="text-sm mt-2">最終在庫確認日: ${r.last_seen_at || "-"}</p>` : ""}
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-6">
+        <div class="bg-black/5 rounded-lg p-4">
+          <p class="text-xs opacity-60 mb-2 font-medium">コストコ原本データ</p>
+          <table class="w-full text-sm">
+            <tr><td class="opacity-60 py-1">通常価格</td><td class="text-right">¥${fmt(r.price_jpy)}</td></tr>
+            ${r.discount_value ? `
+            <tr><td class="opacity-60 py-1">値引き額</td><td class="text-right">¥${fmt(r.discount_value)}</td></tr>
+            <tr><td class="opacity-60 py-1 font-medium">実効価格</td><td class="text-right font-medium">¥${fmt(r.effectivePrice)}</td></tr>
+            <tr><td class="opacity-60 py-1">値引き期間</td><td class="text-right text-xs">${r.discount_start_date || ""} 〜 ${r.discount_end_date || ""}</td></tr>` : ""}
+            <tr><td class="opacity-60 py-1">在庫数(コストコ)</td><td class="text-right">${r.stock_level ?? "-"}</td></tr>
+            <tr><td class="opacity-60 py-1">最終確認日</td><td class="text-right">${r.last_seen_at || "-"}</td></tr>
+            <tr><td class="opacity-60 py-1">コストコページ</td><td class="text-right">${r.costco_url ? `<a href="${r.costco_url}" target="_blank" class="text-blue-600 hover:underline text-xs">開く ↗</a>` : "-"}</td></tr>
+          </table>
+          ${r.summary ? `<p class="text-xs mt-3 opacity-80">${escapeHtml(r.summary)}</p>` : ""}
+        </div>
+
+        <div class="bg-black/5 rounded-lg p-4">
+          <p class="text-xs opacity-60 mb-2 font-medium">楽天市場データ</p>
+          ${r.isListed ? `
+          <table class="w-full text-sm">
+            <tr><td class="opacity-60 py-1">楽天販売価格</td><td class="text-right">¥${fmt(r.rakuten_price)}</td></tr>
+            <tr><td class="opacity-60 py-1">楽天在庫数</td><td class="text-right">${r.rakuten_stock ?? "-"}</td></tr>
+            <tr><td class="opacity-60 py-1">最終取込日</td><td class="text-right">${r.rakuten_updated || "-"}</td></tr>
+            <tr><td class="opacity-60 py-1">商品ページ</td><td class="text-right">${r.rakuten_url ? `<a href="${r.rakuten_url}" target="_blank" class="text-blue-600 hover:underline text-xs">開く ↗</a>` : "-"}</td></tr>
+          </table>` : `<p class="text-sm opacity-70">楽天に未出品です</p>`}
+          <p class="text-xs opacity-50 mt-3">想定送料・粗利区分: 未実装(今後追加予定)</p>
+        </div>
+      </div>
+
+      ${r.description ? `
+      <div class="bg-black/5 rounded-lg p-4 mt-4">
+        <p class="text-xs opacity-60 mb-2 font-medium">商品説明</p>
+        <p class="text-sm whitespace-pre-line">${escapeHtml(r.description)}</p>
+      </div>` : ""}
+    </div>
+  `;
+}
+
+function fmt(n) {
+  if (n === null || n === undefined) return "-";
+  return Number(n).toLocaleString();
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
+}
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+main();
+</script>
+</body>
+</html>
