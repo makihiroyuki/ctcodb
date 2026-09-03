@@ -148,7 +148,8 @@ function handleRoute() {
 
 function renderList() {
   const q = (document.getElementById("search-input")?.value || "").toLowerCase();
-  const statusFilter = document.getElementById("status-filter")?.value || "";
+  const hasStatusEl = document.getElementById("status-filter");
+  const statusFilter = hasStatusEl ? hasStatusEl.value : (params.get("status") ?? "未出品(出品可)");
 
   let rows = ALL_ROWS;
   if (q) {
@@ -187,11 +188,16 @@ function renderList() {
 function cardHtml(r) {
   return `
     <a href="#/sku/${encodeURIComponent(r.variant_sku)}" class="block rounded-lg p-4 ${STATUS_STYLE[r.status]} hover:opacity-90">
-      <p class="font-medium text-sm mb-1">${escapeHtml(r.name || "")}</p>
-      <p class="text-xs opacity-70 mb-2">${escapeHtml(r.our_sku || "")}</p>
-      <span class="text-xs px-2 py-1 rounded bg-black/10">${r.status}</span>
-      ${r.exclusionReason ? `<p class="text-xs mt-1 opacity-80">理由: ${escapeHtml(r.exclusionReason)}</p>` : ""}
-      ${r.status === "在庫0" ? `<p class="text-xs mt-1 opacity-80">最終在庫確認日: ${r.last_seen_at || "-"}</p>` : ""}
+      <div class="flex gap-3">
+        ${r.primary_image_url ? `<img src="${r.primary_image_url}" loading="lazy" class="w-14 h-14 object-contain bg-white rounded flex-shrink-0" alt="">` : ""}
+        <div class="min-w-0">
+          <p class="font-medium text-sm mb-1 truncate">${escapeHtml(r.name || "")}</p>
+          <p class="text-xs opacity-70 mb-2">${escapeHtml(r.our_sku || "")}</p>
+          <span class="text-xs px-2 py-1 rounded bg-black/10">${r.status}</span>
+        </div>
+      </div>
+      ${r.exclusionReason ? `<p class="text-xs mt-2 opacity-80">除外理由: ${escapeHtml(r.exclusionReason)}</p>` : ""}
+      ${r.status === "在庫0" ? `<p class="text-xs mt-2 opacity-80">最終在庫確認日: ${r.last_seen_at || "-"}</p>` : ""}
     </a>
   `;
 }
