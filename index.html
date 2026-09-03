@@ -33,6 +33,9 @@ let KEYWORDS = [];
 let SKU_REASONS = {};
 let ALL_ROWS = [];
 let EDIT_MODE = false;
+let CATEGORY_GROUPS = []; // [{filter_id, broad_category}]
+let VISIBLE_COUNT = 60;
+let CACHED_FILTERED_ROWS = [];
 
 // ------------------------------------------------------------------
 // ステータス変更モード / 除外キーワード追加: localStorageに一時保存し、
@@ -85,6 +88,7 @@ async function main() {
     DB = new SQL.Database(bytes);
 
     loadExclusions();
+    loadCategoryMap();
     ALL_ROWS = computeAllStatuses();
 
     handleRoute();
@@ -132,20 +136,31 @@ function exclusionReason(baseSku, variantSku, name) {
   return null;
 }
 
+function loadCategoryMap() {
+  const rows = queryAll("SELECT DISTINCT filter_id, broad_category FROM category_map ORDER BY broad_category");
+  CATEGORY_GROUPS = rows;
+}
+
 function computeAllStatuses() {
   const rows = queryAll(`
     SELECT v.variant_sku, v.base_sku, v.our_sku, v.dimension_path, v.color_name,
            v.cost_jpy, v.stock_status, v.stock_level, v.last_seen_at,
            p.name, p.english_name, p.url AS costco_url, p.price_jpy, p.discount_value,
            p.discount_start_date, p.discount_end_date, p.average_rating, p.number_of_reviews,
-           p.description, p.summary, p.primary_image_url,
+           p.description, p.summary, p.primary_image_url, p.category_code,
+           cm.filter_id AS category_filter_id, cm.broad_category AS category_name,
            r.variant_sku AS rakuten_variant_sku, r.our_sku AS rakuten_product_id,
            r.sku_code, r.product_url AS rakuten_url, r.price_jpy AS rakuten_price,
            r.stock_count AS rakuten_stock, r.updated_at AS rakuten_updated
     FROM variants v
     JOIN products p ON p.base_sku = v.base_sku
     LEFT JOIN rakuten_listing r ON r.variant_sku = v.variant_sku
+    LEFT JOIN category_map cm ON cm.category_code = p.category_code
   `);
+
+  // base_sku ごとの出現回数を数えて「バリエーション商品」判定に使う
+  const baseSkuCounts = {};
+  for (const row of rows) baseSkuCounts[row.base_sku] = (baseSkuCounts[row.base_sku] || 0) + 1;
 
   const now = new Date();
   return rows.map(row => {
@@ -163,7 +178,8 @@ function computeAllStatuses() {
     else if ((row.rakuten_stock || 0) > 0) status = "出品中";
     else status = "在庫0";
 
-    return { ...row, status, exclusionReason: reason, isListed, effectivePrice };
+    const hasVariants = baseSkuCounts[row.base_sku] > 1;
+    return { ...row, status, exclusionReason: reason, isListed, effectivePrice, hasVariants };
   });
 }
 
@@ -191,10 +207,11 @@ function navBarHtml() {
   `;
 }
 
-function renderList() {
+function renderList(preserveScroll) {
   const q = (document.getElementById("search-input")?.value || "").toLowerCase();
   const hasStatusEl = document.getElementById("status-filter");
   const statusFilter = hasStatusEl ? hasStatusEl.value : (params.get("status") ?? "未出品(出品可)");
+  const selectedCategories = Array.from(document.querySelectorAll(".cat-checkbox:checked")).map(el => el.value);
 
   let rows = ALL_ROWS;
   if (q) {
@@ -205,9 +222,12 @@ function renderList() {
     );
   }
   if (statusFilter) rows = rows.filter(r => r.status === statusFilter);
+  if (selectedCategories.length) rows = rows.filter(r => selectedCategories.includes(r.category_filter_id));
 
-  const PAGE_SIZE = 60;
-  const shown = rows.slice(0, PAGE_SIZE);
+  CACHED_FILTERED_ROWS = rows;
+  if (!preserveScroll) VISIBLE_COUNT = 60;
+
+  const shown = rows.slice(0, VISIBLE_COUNT);
   const pending = getPendingStatus();
   const pendingCount = Object.keys(pending).length;
 
@@ -220,7 +240,7 @@ function renderList() {
       </button>
     </div>
     ${EDIT_MODE ? `<p class="text-xs text-neutral-600 mb-3">「未出品(出品可)」⇄「出品除外商品」のカードをクリックすると切り替え予約されます(出品中/在庫0は変更できません)。</p>` : ""}
-    <div class="flex gap-2 mb-4">
+    <div class="flex gap-2 mb-3">
       <input id="search-input" type="text" placeholder="商品名 or SKU で検索"
              class="border rounded px-3 py-2 flex-1" value="${escapeHtml(q)}">
       <select id="status-filter" class="border rounded px-3 py-2">
@@ -230,10 +250,24 @@ function renderList() {
         ).join("")}
       </select>
     </div>
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 ${pendingCount ? "pb-20" : ""}">
+    ${CATEGORY_GROUPS.length ? `
+    <details class="mb-4 border rounded-lg p-3 bg-white/50" ${selectedCategories.length ? "open" : ""}>
+      <summary class="text-sm cursor-pointer select-none">カテゴリで絞り込み ${selectedCategories.length ? `(${selectedCategories.length}件選択中)` : ""}</summary>
+      <div class="flex flex-wrap gap-x-4 gap-y-2 mt-3">
+        ${CATEGORY_GROUPS.map(c => `
+          <label class="text-sm flex items-center gap-1">
+            <input type="checkbox" class="cat-checkbox" value="${c.filter_id}" ${selectedCategories.includes(c.filter_id) ? "checked" : ""}>
+            ${escapeHtml(c.broad_category)}
+          </label>
+        `).join("")}
+      </div>
+    </details>` : ""}
+    <div id="card-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 ${pendingCount ? "pb-20" : ""}">
       ${shown.map(r => cardHtml(r, pending)).join("")}
     </div>
-    ${rows.length > PAGE_SIZE ? `<p class="text-center text-neutral-500 mt-4">上位${PAGE_SIZE}件を表示中。検索で絞り込んでください。</p>` : ""}
+    <div id="scroll-sentinel" class="py-8 text-center text-neutral-400 text-sm">
+      ${shown.length < rows.length ? "読み込み中... 下にスクロールしてください" : (rows.length ? "全件表示しました" : "該当する商品がありません")}
+    </div>
     ${pendingCount ? `
     <div class="fixed bottom-0 left-0 right-0 bg-neutral-900 text-white p-4 flex items-center justify-between gap-4">
       <span class="text-sm">変更予約: ${pendingCount}件</span>
@@ -244,14 +278,15 @@ function renderList() {
     </div>` : ""}
   `;
   document.getElementById("search-input").addEventListener("input", debounce(renderList, 200));
-  document.getElementById("status-filter").addEventListener("change", renderList);
+  document.getElementById("status-filter").addEventListener("change", () => renderList());
+  document.querySelectorAll(".cat-checkbox").forEach(el => el.addEventListener("change", () => renderList()));
   document.getElementById("edit-mode-toggle").addEventListener("click", () => {
     EDIT_MODE = !EDIT_MODE;
     renderList();
   });
   if (pendingCount) {
     document.getElementById("pending-reset").addEventListener("click", () => {
-      if (confirm("変更予約を全て取り消しますか?")) { setPendingStatus({}); renderList(); }
+      if (confirm("変更予約を全て取り消しますか?")) { setPendingStatus({}); renderList(true); }
     });
     document.getElementById("pending-export").addEventListener("click", () => {
       const p = getPendingStatus();
@@ -267,6 +302,21 @@ function renderList() {
       });
     });
   }
+  setupInfiniteScroll();
+}
+
+function setupInfiniteScroll() {
+  if (window._ctcoScrollHandlerAttached) return;
+  window._ctcoScrollHandlerAttached = true;
+  window.addEventListener("scroll", debounce(() => {
+    if (!location.hash || location.hash === "#/" || location.hash === "") {
+      const nearBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 400;
+      if (nearBottom && VISIBLE_COUNT < CACHED_FILTERED_ROWS.length) {
+        VISIBLE_COUNT += 60;
+        renderList(true);
+      }
+    }
+  }, 150));
 }
 
 function toggleStatusOverride(variantSku) {
@@ -300,6 +350,7 @@ function cardHtml(r, pending) {
         <p class="font-medium text-sm mb-1 truncate">${escapeHtml(r.name || "")}</p>
         <p class="text-xs opacity-70 mb-2">${escapeHtml(r.our_sku || "")}</p>
         <span class="text-xs px-2 py-1 rounded bg-black/10">${r.status}</span>
+        ${r.hasVariants ? `<span class="text-xs px-2 py-1 rounded bg-blue-600/20 ml-1">バリエーション商品</span>` : ""}
       </div>
     </div>
     ${r.exclusionReason ? `<p class="text-xs mt-2 opacity-80">除外理由: ${escapeHtml(r.exclusionReason)}</p>` : ""}
@@ -331,6 +382,8 @@ function renderDetail(variantSku) {
         ${r.primary_image_url ? `<img src="${r.primary_image_url}" class="w-40 h-40 object-contain bg-white rounded-lg flex-shrink-0" alt="">` : ""}
         <div>
           <span class="inline-block text-xs px-2 py-1 rounded bg-black/10 mb-2">${r.status}</span>
+          ${r.hasVariants ? `<span class="inline-block text-xs px-2 py-1 rounded bg-blue-600/20 mb-2 ml-1">バリエーション商品</span>` : ""}
+          ${r.category_name ? `<span class="inline-block text-xs px-2 py-1 rounded bg-black/10 mb-2 ml-1">${escapeHtml(r.category_name)}</span>` : ""}
           <h1 class="text-xl font-bold">${escapeHtml(r.name || "")}</h1>
           <p class="opacity-70 text-sm">${escapeHtml(r.english_name || "")}</p>
           <p class="opacity-70 text-sm mt-1">variant_sku: ${r.variant_sku} / our_sku: ${r.our_sku || "-"}</p>
