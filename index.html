@@ -32,6 +32,40 @@ let DB = null;
 let KEYWORDS = [];
 let SKU_REASONS = {};
 let ALL_ROWS = [];
+let EDIT_MODE = false;
+
+// ------------------------------------------------------------------
+// ステータス変更モード / 除外キーワード追加: localStorageに一時保存し、
+// CSVとして書き出して apply_status_override.py で反映する運用。
+// ------------------------------------------------------------------
+const PENDING_STATUS_KEY = "ctco_pending_status_overrides";
+const PENDING_KEYWORDS_KEY = "ctco_pending_keywords";
+
+function getPendingStatus() {
+  return JSON.parse(localStorage.getItem(PENDING_STATUS_KEY) || "{}");
+}
+function setPendingStatus(obj) {
+  localStorage.setItem(PENDING_STATUS_KEY, JSON.stringify(obj));
+}
+function getPendingKeywords() {
+  return JSON.parse(localStorage.getItem(PENDING_KEYWORDS_KEY) || "[]");
+}
+function setPendingKeywords(arr) {
+  localStorage.setItem(PENDING_KEYWORDS_KEY, JSON.stringify(arr));
+}
+
+function downloadCsv(filename, headerCols, rows) {
+  const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const lines = [headerCols.join(",")].concat(
+    rows.map(r => headerCols.map(c => esc(r[c])).join(","))
+  );
+  const bom = "\uFEFF"; // Excelで開いた時の文字化け防止
+  const blob = new Blob([bom + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+}
 
 const app = document.getElementById("app");
 
@@ -140,10 +174,21 @@ function handleRoute() {
   const hash = location.hash.slice(1);
   if (hash.startsWith("/sku/")) {
     renderDetail(decodeURIComponent(hash.slice(5)));
+  } else if (hash === "/keywords") {
+    renderKeywordsPage();
   } else {
     renderList();
   }
   window.scrollTo(0, 0);
+}
+
+function navBarHtml() {
+  return `
+    <div class="flex gap-4 mb-4 text-sm">
+      <a href="#/" class="text-blue-600 hover:underline">商品一覧</a>
+      <a href="#/keywords" class="text-blue-600 hover:underline">除外キーワード管理</a>
+    </div>
+  `;
 }
 
 function renderList() {
@@ -163,9 +208,18 @@ function renderList() {
 
   const PAGE_SIZE = 60;
   const shown = rows.slice(0, PAGE_SIZE);
+  const pending = getPendingStatus();
+  const pendingCount = Object.keys(pending).length;
 
   app.innerHTML = `
-    <h1 class="text-xl font-bold mb-4">CTCO DB 商品一覧 (${rows.length}件 / 全${ALL_ROWS.length}件)</h1>
+    ${navBarHtml()}
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="text-xl font-bold">CTCO DB 商品一覧 (${rows.length}件 / 全${ALL_ROWS.length}件)</h1>
+      <button id="edit-mode-toggle" class="text-sm px-3 py-2 rounded ${EDIT_MODE ? "bg-blue-600 text-white" : "bg-neutral-200"}">
+        ${EDIT_MODE ? "ステータス変更モード: ON" : "ステータス変更モード: OFF"}
+      </button>
+    </div>
+    ${EDIT_MODE ? `<p class="text-xs text-neutral-600 mb-3">「未出品(出品可)」⇄「出品除外商品」のカードをクリックすると切り替え予約されます(出品中/在庫0は変更できません)。</p>` : ""}
     <div class="flex gap-2 mb-4">
       <input id="search-input" type="text" placeholder="商品名 or SKU で検索"
              class="border rounded px-3 py-2 flex-1" value="${escapeHtml(q)}">
@@ -176,30 +230,87 @@ function renderList() {
         ).join("")}
       </select>
     </div>
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-      ${shown.map(cardHtml).join("")}
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 ${pendingCount ? "pb-20" : ""}">
+      ${shown.map(r => cardHtml(r, pending)).join("")}
     </div>
     ${rows.length > PAGE_SIZE ? `<p class="text-center text-neutral-500 mt-4">上位${PAGE_SIZE}件を表示中。検索で絞り込んでください。</p>` : ""}
+    ${pendingCount ? `
+    <div class="fixed bottom-0 left-0 right-0 bg-neutral-900 text-white p-4 flex items-center justify-between gap-4">
+      <span class="text-sm">変更予約: ${pendingCount}件</span>
+      <div class="flex gap-2">
+        <button id="pending-reset" class="text-sm px-3 py-2 rounded bg-neutral-700">リセット</button>
+        <button id="pending-export" class="text-sm px-3 py-2 rounded bg-white text-neutral-900 font-medium">CSVを書き出す</button>
+      </div>
+    </div>` : ""}
   `;
   document.getElementById("search-input").addEventListener("input", debounce(renderList, 200));
   document.getElementById("status-filter").addEventListener("change", renderList);
+  document.getElementById("edit-mode-toggle").addEventListener("click", () => {
+    EDIT_MODE = !EDIT_MODE;
+    renderList();
+  });
+  if (pendingCount) {
+    document.getElementById("pending-reset").addEventListener("click", () => {
+      if (confirm("変更予約を全て取り消しますか?")) { setPendingStatus({}); renderList(); }
+    });
+    document.getElementById("pending-export").addEventListener("click", () => {
+      const p = getPendingStatus();
+      const rowsOut = Object.entries(p).map(([sku, v]) => ({ sku, override: v.override, reason: v.reason || "" }));
+      downloadCsv(`status_override_${Date.now()}.csv`, ["sku", "override", "reason"], rowsOut);
+    });
+  }
+  if (EDIT_MODE) {
+    document.querySelectorAll("[data-toggle-sku]").forEach(el => {
+      el.addEventListener("click", (e) => {
+        e.preventDefault();
+        toggleStatusOverride(el.dataset.toggleSku);
+      });
+    });
+  }
 }
 
-function cardHtml(r) {
-  return `
-    <a href="#/sku/${encodeURIComponent(r.variant_sku)}" class="block rounded-lg p-4 ${STATUS_STYLE[r.status]} hover:opacity-90">
-      <div class="flex gap-3">
-        ${r.primary_image_url ? `<img src="${r.primary_image_url}" loading="lazy" class="w-14 h-14 object-contain bg-white rounded flex-shrink-0" alt="">` : ""}
-        <div class="min-w-0">
-          <p class="font-medium text-sm mb-1 truncate">${escapeHtml(r.name || "")}</p>
-          <p class="text-xs opacity-70 mb-2">${escapeHtml(r.our_sku || "")}</p>
-          <span class="text-xs px-2 py-1 rounded bg-black/10">${r.status}</span>
-        </div>
+function toggleStatusOverride(variantSku) {
+  const row = ALL_ROWS.find(r => r.variant_sku === variantSku);
+  if (!row) return;
+  const pending = getPendingStatus();
+
+  if (pending[variantSku]) {
+    delete pending[variantSku]; // 2度目のクリックで予約解除
+  } else if (row.status === "未出品(出品可)") {
+    pending[variantSku] = { override: "exclude", reason: "Webアプリで手動除外", name: row.name };
+  } else if (row.status === "出品除外商品") {
+    pending[variantSku] = { override: "allow", reason: "Webアプリで手動許可", name: row.name };
+  } else {
+    return; // 出品中/在庫0は対象外
+  }
+  setPendingStatus(pending);
+  renderList();
+}
+
+function cardHtml(r, pending) {
+  const isEligible = r.status === "未出品(出品可)" || r.status === "出品除外商品";
+  const pendingChange = pending && pending[r.variant_sku];
+  const editable = EDIT_MODE && isEligible;
+
+  const ring = pendingChange ? "ring-4 ring-blue-500" : "";
+  const inner = `
+    <div class="flex gap-3">
+      ${r.primary_image_url ? `<img src="${r.primary_image_url}" loading="lazy" class="w-14 h-14 object-contain bg-white rounded flex-shrink-0" alt="">` : ""}
+      <div class="min-w-0">
+        <p class="font-medium text-sm mb-1 truncate">${escapeHtml(r.name || "")}</p>
+        <p class="text-xs opacity-70 mb-2">${escapeHtml(r.our_sku || "")}</p>
+        <span class="text-xs px-2 py-1 rounded bg-black/10">${r.status}</span>
       </div>
-      ${r.exclusionReason ? `<p class="text-xs mt-2 opacity-80">除外理由: ${escapeHtml(r.exclusionReason)}</p>` : ""}
-      ${r.status === "在庫0" ? `<p class="text-xs mt-2 opacity-80">最終在庫確認日: ${r.last_seen_at || "-"}</p>` : ""}
-    </a>
+    </div>
+    ${r.exclusionReason ? `<p class="text-xs mt-2 opacity-80">除外理由: ${escapeHtml(r.exclusionReason)}</p>` : ""}
+    ${r.status === "在庫0" ? `<p class="text-xs mt-2 opacity-80">最終在庫確認日: ${r.last_seen_at || "-"}</p>` : ""}
+    ${pendingChange ? `<p class="text-xs mt-2 font-medium">→ ${pendingChange.override === "exclude" ? "除外に変更予定" : "出品可に変更予定"}(クリックで取消)</p>` : ""}
   `;
+
+  if (editable) {
+    return `<div data-toggle-sku="${r.variant_sku}" class="block rounded-lg p-4 cursor-pointer ${STATUS_STYLE[r.status]} ${ring} hover:opacity-90">${inner}</div>`;
+  }
+  return `<a href="#/sku/${encodeURIComponent(r.variant_sku)}" class="block rounded-lg p-4 ${STATUS_STYLE[r.status]} ${EDIT_MODE ? "opacity-50" : "hover:opacity-90"}">${inner}</a>`;
 }
 
 function renderDetail(variantSku) {
@@ -265,6 +376,68 @@ function renderDetail(variantSku) {
       </div>` : ""}
     </div>
   `;
+}
+
+function renderKeywordsPage() {
+  const pending = getPendingKeywords();
+  const currentKeywords = queryAll("SELECT keyword, reason FROM exclusion_keywords ORDER BY keyword");
+
+  app.innerHTML = `
+    ${navBarHtml()}
+    <h1 class="text-xl font-bold mb-4">除外キーワード管理</h1>
+
+    <div class="bg-black/5 rounded-lg p-4 mb-4">
+      <p class="text-xs opacity-60 mb-2 font-medium">新しいキーワードを追加(まだ保存されていません)</p>
+      <div class="flex gap-2">
+        <input id="new-keyword" type="text" placeholder="キーワード(商品名に含まれていたら除外)" class="border rounded px-3 py-2 flex-1">
+        <input id="new-reason" type="text" placeholder="理由(任意)" class="border rounded px-3 py-2 flex-1">
+        <button id="add-keyword" class="bg-neutral-800 text-white px-4 py-2 rounded">追加</button>
+      </div>
+    </div>
+
+    ${pending.length ? `
+    <div class="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+      <p class="text-xs opacity-60 mb-2 font-medium">追加予定(${pending.length}件、まだCSV未書き出し)</p>
+      <div class="flex flex-col gap-1">
+        ${pending.map((k, i) => `
+          <div class="flex items-center justify-between text-sm bg-white rounded px-3 py-2">
+            <span>${escapeHtml(k.keyword)} ${k.reason ? `<span class="opacity-60">(${escapeHtml(k.reason)})</span>` : ""}</span>
+            <button data-remove-idx="${i}" class="text-red-600 text-xs">削除</button>
+          </div>
+        `).join("")}
+      </div>
+      <button id="export-keywords" class="mt-3 bg-neutral-900 text-white px-4 py-2 rounded text-sm">CSVを書き出す(${pending.length}件)</button>
+    </div>` : ""}
+
+    <p class="text-xs opacity-60 mb-2 font-medium">現在登録済みのキーワード(${currentKeywords.length}件)</p>
+    <div class="flex flex-wrap gap-1">
+      ${currentKeywords.map(k => `<span class="text-xs bg-black/5 rounded px-2 py-1" title="${escapeHtml(k.reason || "")}">${escapeHtml(k.keyword)}</span>`).join("")}
+    </div>
+  `;
+
+  document.getElementById("add-keyword").addEventListener("click", () => {
+    const kw = document.getElementById("new-keyword").value.trim();
+    const reason = document.getElementById("new-reason").value.trim();
+    if (!kw) return;
+    const p = getPendingKeywords();
+    p.push({ keyword: kw, reason });
+    setPendingKeywords(p);
+    renderKeywordsPage();
+  });
+  document.querySelectorAll("[data-remove-idx]").forEach(el => {
+    el.addEventListener("click", () => {
+      const p = getPendingKeywords();
+      p.splice(Number(el.dataset.removeIdx), 1);
+      setPendingKeywords(p);
+      renderKeywordsPage();
+    });
+  });
+  const exportBtn = document.getElementById("export-keywords");
+  if (exportBtn) {
+    exportBtn.addEventListener("click", () => {
+      downloadCsv(`new_keywords_${Date.now()}.csv`, ["keyword", "reason"], getPendingKeywords());
+    });
+  }
 }
 
 function fmt(n) {
