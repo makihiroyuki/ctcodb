@@ -125,12 +125,13 @@ function loadExclusions() {
   }
 }
 
-function exclusionReason(baseSku, variantSku, name) {
+function exclusionReason(baseSku, variantSku, name, description, summary) {
   if (SKU_REASONS[baseSku]) return SKU_REASONS[baseSku];
   if (SKU_REASONS[variantSku]) return SKU_REASONS[variantSku];
-  if (name) {
+  const combined = [name, description, summary].filter(Boolean).join(" ");
+  if (combined) {
     for (const kw of KEYWORDS) {
-      if (name.includes(kw)) return `除外キーワード「${kw}」`;
+      if (combined.includes(kw)) return `除外キーワード「${kw}」`;
     }
   }
   return null;
@@ -172,7 +173,7 @@ function computeAllStatuses() {
 
   const now = new Date();
   return rows.map(row => {
-    const reason = exclusionReason(row.base_sku, row.variant_sku, row.name);
+    const reason = exclusionReason(row.base_sku, row.variant_sku, row.name, row.description, row.summary);
     const isListed = row.rakuten_variant_sku !== null && row.rakuten_variant_sku !== undefined;
 
     let status, effectivePrice = row.price_jpy;
