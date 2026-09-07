@@ -151,6 +151,10 @@ function computeAllStatuses() {
     "SELECT name FROM sqlite_master WHERE type='table' AND name='category_map'"
   ).length > 0;
 
+  const shippingMarginExists = queryAll(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='shipping_margin'"
+  ).length > 0;
+
   const rows = queryAll(`
     SELECT v.variant_sku, v.base_sku, v.our_sku, v.dimension_path, v.color_name,
            v.cost_jpy, v.stock_status, v.stock_level, v.last_seen_at,
@@ -158,6 +162,7 @@ function computeAllStatuses() {
            p.discount_start_date, p.discount_end_date, p.average_rating, p.number_of_reviews,
            p.description, p.summary, p.primary_image_url,
            ${categoryMapExists ? "p.category_code, cm.filter_id AS category_filter_id, cm.broad_category AS category_name," : "NULL AS category_code, NULL AS category_filter_id, NULL AS category_name,"}
+           ${shippingMarginExists ? "sm.shipping_cost, sm.margin," : "NULL AS shipping_cost, NULL AS margin,"}
            r.variant_sku AS rakuten_variant_sku, r.our_sku AS rakuten_product_id,
            r.sku_code, r.product_url AS rakuten_url, r.price_jpy AS rakuten_price,
            r.stock_count AS rakuten_stock, r.updated_at AS rakuten_updated
@@ -165,6 +170,7 @@ function computeAllStatuses() {
     JOIN products p ON p.base_sku = v.base_sku
     LEFT JOIN rakuten_listing r ON r.variant_sku = v.variant_sku
     ${categoryMapExists ? "LEFT JOIN category_map cm ON cm.category_code = p.category_code" : ""}
+    ${shippingMarginExists ? "LEFT JOIN shipping_margin sm ON sm.base_sku = v.base_sku" : ""}
   `);
 
   // base_sku ごとの出現回数を数えて「バリエーション商品」判定に使う
@@ -188,7 +194,10 @@ function computeAllStatuses() {
     else status = "在庫0";
 
     const hasVariants = baseSkuCounts[row.base_sku] > 1;
-    return { ...row, status, exclusionReason: reason, isListed, effectivePrice, hasVariants };
+    const expectedRakutenPrice = (row.shipping_cost != null && row.margin != null)
+      ? Math.ceil((row.cost_jpy + row.shipping_cost + row.margin) / 0.9)
+      : null;
+    return { ...row, status, exclusionReason: reason, isListed, effectivePrice, hasVariants, expectedRakutenPrice };
   });
 }
 
@@ -244,9 +253,12 @@ function renderList(preserveScroll) {
     ${navBarHtml()}
     <div class="flex items-center justify-between mb-4">
       <h1 class="text-xl font-bold">CTCO DB 商品一覧 (${rows.length}件 / 全${ALL_ROWS.length}件)</h1>
-      <button id="edit-mode-toggle" class="text-sm px-3 py-2 rounded ${EDIT_MODE ? "bg-blue-600 text-white" : "bg-neutral-200"}">
-        ${EDIT_MODE ? "ステータス変更モード: ON" : "ステータス変更モード: OFF"}
-      </button>
+      <div class="flex gap-2">
+        <button id="download-sku-list" class="text-sm px-3 py-2 rounded bg-neutral-200">この絞り込みのSKUリストをDL</button>
+        <button id="edit-mode-toggle" class="text-sm px-3 py-2 rounded ${EDIT_MODE ? "bg-blue-600 text-white" : "bg-neutral-200"}">
+          ${EDIT_MODE ? "ステータス変更モード: ON" : "ステータス変更モード: OFF"}
+        </button>
+      </div>
     </div>
     ${EDIT_MODE ? `<p class="text-xs text-neutral-600 mb-3">「未出品(出品可)」⇄「出品除外商品」のカードをクリックすると切り替え予約されます(出品中/在庫0は変更できません)。</p>` : ""}
     <div class="flex gap-2 mb-3">
@@ -292,6 +304,12 @@ function renderList(preserveScroll) {
   document.getElementById("edit-mode-toggle").addEventListener("click", () => {
     EDIT_MODE = !EDIT_MODE;
     renderList();
+  });
+  document.getElementById("download-sku-list").addEventListener("click", () => {
+    const rowsOut = CACHED_FILTERED_ROWS.map(r => ({
+      base_sku: r.base_sku, variant_sku: r.variant_sku, our_sku: r.our_sku, name: r.name, status: r.status,
+    }));
+    downloadCsv(`sku_list_${Date.now()}.csv`, ["base_sku", "variant_sku", "our_sku", "name", "status"], rowsOut);
   });
   if (pendingCount) {
     document.getElementById("pending-reset").addEventListener("click", () => {
@@ -427,7 +445,19 @@ function renderDetail(variantSku) {
             <tr><td class="opacity-60 py-1">最終取込日</td><td class="text-right">${r.rakuten_updated || "-"}</td></tr>
             <tr><td class="opacity-60 py-1">商品ページ</td><td class="text-right">${r.rakuten_url ? `<a href="${r.rakuten_url}" target="_blank" class="text-blue-600 hover:underline text-xs">開く ↗</a>` : "-"}</td></tr>
           </table>` : `<p class="text-sm opacity-70">楽天に未出品です</p>`}
-          <p class="text-xs opacity-50 mt-3">想定送料・粗利区分: 未実装(今後追加予定)</p>
+        </div>
+
+        <div class="bg-black/5 rounded-lg p-4">
+          <p class="text-xs opacity-60 mb-2 font-medium">自社送料・粗利データ</p>
+          ${(r.shipping_cost != null && r.margin != null) ? `
+          <table class="w-full text-sm">
+            <tr><td class="opacity-60 py-1">想定送料</td><td class="text-right">¥${fmt(r.shipping_cost)}</td></tr>
+            <tr><td class="opacity-60 py-1">粗利</td><td class="text-right">¥${fmt(r.margin)}</td></tr>
+            <tr><td class="opacity-60 py-1 font-medium">計算上の楽天価格</td><td class="text-right font-medium">¥${fmt(r.expectedRakutenPrice)}</td></tr>
+            ${r.rakuten_price != null ? `<tr><td class="opacity-60 py-1">実際の楽天価格との差</td><td class="text-right">¥${fmt(r.expectedRakutenPrice - r.rakuten_price)}</td></tr>` : ""}
+          </table>
+          <p class="text-xs mt-2 opacity-50">計算式: (仕入値 + 送料 + 粗利) ÷ 0.9(切り上げ)</p>
+          ` : `<p class="text-sm opacity-70">この品番の送料・粗利データがありません</p>`}
         </div>
       </div>
 
