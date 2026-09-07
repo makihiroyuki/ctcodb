@@ -244,9 +244,12 @@ function renderList(preserveScroll) {
     ${navBarHtml()}
     <div class="flex items-center justify-between mb-4">
       <h1 class="text-xl font-bold">CTCO DB 商品一覧 (${rows.length}件 / 全${ALL_ROWS.length}件)</h1>
-      <button id="edit-mode-toggle" class="text-sm px-3 py-2 rounded ${EDIT_MODE ? "bg-blue-600 text-white" : "bg-neutral-200"}">
-        ${EDIT_MODE ? "ステータス変更モード: ON" : "ステータス変更モード: OFF"}
-      </button>
+      <div class="flex gap-2">
+        <button id="download-sku-list" class="text-sm px-3 py-2 rounded bg-neutral-200">この絞り込みのSKUリストをDL</button>
+        <button id="edit-mode-toggle" class="text-sm px-3 py-2 rounded ${EDIT_MODE ? "bg-blue-600 text-white" : "bg-neutral-200"}">
+          ${EDIT_MODE ? "ステータス変更モード: ON" : "ステータス変更モード: OFF"}
+        </button>
+      </div>
     </div>
     ${EDIT_MODE ? `<p class="text-xs text-neutral-600 mb-3">「未出品(出品可)」⇄「出品除外商品」のカードをクリックすると切り替え予約されます(出品中/在庫0は変更できません)。</p>` : ""}
     <div class="flex gap-2 mb-3">
@@ -292,6 +295,12 @@ function renderList(preserveScroll) {
   document.getElementById("edit-mode-toggle").addEventListener("click", () => {
     EDIT_MODE = !EDIT_MODE;
     renderList();
+  });
+  document.getElementById("download-sku-list").addEventListener("click", () => {
+    const rowsOut = CACHED_FILTERED_ROWS.map(r => ({
+      base_sku: r.base_sku, variant_sku: r.variant_sku, our_sku: r.our_sku, name: r.name, status: r.status,
+    }));
+    downloadCsv(`sku_list_${Date.now()}.csv`, ["base_sku", "variant_sku", "our_sku", "name", "status"], rowsOut);
   });
   if (pendingCount) {
     document.getElementById("pending-reset").addEventListener("click", () => {
