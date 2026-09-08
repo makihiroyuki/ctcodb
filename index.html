@@ -36,6 +36,7 @@ let EDIT_MODE = false;
 let CATEGORY_GROUPS = []; // [{filter_id, broad_category}]
 let VISIBLE_COUNT = 60;
 let CACHED_FILTERED_ROWS = [];
+let EXTRACT_FILES = { skuList: null, productDetails: null, variantsFull: null };
 
 // ------------------------------------------------------------------
 // ステータス変更モード / 除外キーワード追加: localStorageに一時保存し、
@@ -57,6 +58,83 @@ function setPendingKeywords(arr) {
   localStorage.setItem(PENDING_KEYWORDS_KEY, JSON.stringify(arr));
 }
 
+// ------------------------------------------------------------------
+// フォルダの記憶(File System Access API, Chrome/Edge対応)。
+// 初回だけフォルダを選んでもらえば、以後は自動でcostco_*.csvを読みに行く。
+// ------------------------------------------------------------------
+const IDB_NAME = "ctco_extract_tool";
+const IDB_STORE = "handles";
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbSet(key, value) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function idbGet(key) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readonly");
+    const req = tx.objectStore(IDB_STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function tryLoadFromFolder(handle) {
+  try {
+    let perm = await handle.queryPermission({ mode: "read" });
+    if (perm !== "granted") perm = await handle.requestPermission({ mode: "read" });
+    if (perm !== "granted") return false;
+
+    const productsFileHandle = await handle.getFileHandle("costco_product_details.csv");
+    const variantsFileHandle = await handle.getFileHandle("costco_variants_full.csv");
+    const productsFile = await productsFileHandle.getFile();
+    const variantsFile = await variantsFileHandle.getFile();
+    EXTRACT_FILES.productDetails = { name: productsFile.name, text: await productsFile.text() };
+    EXTRACT_FILES.variantsFull = { name: variantsFile.name, text: await variantsFile.text() };
+    return true;
+  } catch (e) {
+    console.warn("フォルダからの自動読み込みに失敗しました", e);
+    return false;
+  }
+}
+
+async function pickCostcoFolder() {
+  if (!window.showDirectoryPicker) {
+    alert("お使いのブラウザは自動読み込みに対応していません(Chrome/Edgeでのみ利用できます)。②③は直接ドロップしてください。");
+    return;
+  }
+  try {
+    const handle = await window.showDirectoryPicker();
+    await idbSet("costcoFolder", handle);
+    const ok = await tryLoadFromFolder(handle);
+    renderExtractAutoStatus(ok);
+  } catch (e) {
+    console.warn("フォルダ選択がキャンセルされました", e);
+  }
+}
+
+function renderExtractAutoStatus(ok) {
+  const el = document.getElementById("extract-auto-status");
+  if (!el) return;
+  el.innerHTML = ok
+    ? `<p class="text-sm text-green-700">✓ costco_product_details.csv / costco_variants_full.csv を自動読み込みしました</p>`
+    : `<p class="text-sm text-amber-700">自動読み込みできませんでした。②③は下に直接ドロップしてください。</p>`;
+  updateExtractButton();
+}
+
 function downloadCsv(filename, headerCols, rows) {
   const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const lines = [headerCols.join(",")].concat(
@@ -68,6 +146,163 @@ function downloadCsv(filename, headerCols, rows) {
   a.href = URL.createObjectURL(blob);
   a.download = filename;
   a.click();
+}
+
+// ------------------------------------------------------------------
+// 元データ抽出ツール: SKUリストCSV + コストコの生CSV2つをブラウザにドロップするだけで、
+// 該当行だけを抽出したCSVをその場でダウンロードする(Python不要)。
+// ------------------------------------------------------------------
+function parseCSV(text) {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // BOM除去
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; } else { inQuotes = false; }
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field); field = "";
+    } else if (c === "\r") {
+      // 無視(\r\nの\r)
+    } else if (c === "\n") {
+      row.push(field); rows.push(row); row = []; field = "";
+    } else {
+      field += c;
+    }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => !(r.length === 1 && r[0] === ""));
+}
+
+function writeCSVField(v) {
+  v = v == null ? "" : String(v);
+  return /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
+function downloadCsvRows(filename, rows) {
+  const text = rows.map(r => r.map(writeCSVField).join(",")).join("\r\n");
+  const blob = new Blob(["\uFEFF" + text], { type: "text/csv;charset=utf-8;" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+}
+
+function dropZoneHtml(id, title) {
+  return `
+    <div id="${id}" class="border-2 border-dashed rounded-lg p-6 text-center cursor-pointer bg-white/50 hover:bg-white">
+      <p class="text-sm font-medium mb-1">${title}</p>
+      <p class="text-xs opacity-60" data-status>ここにドラッグ&ドロップ、またはクリックして選択</p>
+      <input type="file" accept=".csv" class="hidden" data-file-input>
+    </div>
+  `;
+}
+
+function setupDropZone(id, key) {
+  const zone = document.getElementById(id);
+  const input = zone.querySelector("[data-file-input]");
+  const status = zone.querySelector("[data-status]");
+
+  const handleFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      EXTRACT_FILES[key] = { name: file.name, text: reader.result };
+      status.textContent = `✓ ${file.name}`;
+      updateExtractButton();
+    };
+    reader.readAsText(file, "utf-8");
+  };
+
+  zone.addEventListener("click", () => input.click());
+  input.addEventListener("change", (e) => handleFile(e.target.files[0]));
+  zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.classList.add("bg-blue-50"); });
+  zone.addEventListener("dragleave", () => zone.classList.remove("bg-blue-50"));
+  zone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    zone.classList.remove("bg-blue-50");
+    handleFile(e.dataTransfer.files[0]);
+  });
+}
+
+function updateExtractButton() {
+  const btn = document.getElementById("extract-run");
+  if (!btn) return;
+  const allReady = EXTRACT_FILES.skuList && EXTRACT_FILES.productDetails && EXTRACT_FILES.variantsFull;
+  btn.disabled = !allReady;
+  btn.textContent = allReady ? "抽出してダウンロード" : "3つのファイルをドロップしてください";
+}
+
+function runExtract() {
+  const skuRows = parseCSV(EXTRACT_FILES.skuList.text);
+  const skuHeader = skuRows[0];
+  const baseIdx = skuHeader.indexOf("base_sku");
+  const variantIdx = skuHeader.indexOf("variant_sku");
+  const baseSkus = new Set();
+  const variantSkus = new Set();
+  for (const r of skuRows.slice(1)) {
+    if (baseIdx >= 0 && r[baseIdx]) baseSkus.add(r[baseIdx]);
+    if (variantIdx >= 0 && r[variantIdx]) variantSkus.add(r[variantIdx]);
+  }
+
+  const productsRows = parseCSV(EXTRACT_FILES.productDetails.text);
+  const pBaseIdx = productsRows[0].indexOf("base_sku");
+  const filteredProducts = [productsRows[0], ...productsRows.slice(1).filter(r => baseSkus.has(r[pBaseIdx]))];
+
+  const variantsRows = parseCSV(EXTRACT_FILES.variantsFull.text);
+  const vVariantIdx = variantsRows[0].indexOf("variant_sku");
+  const filteredVariants = [variantsRows[0], ...variantsRows.slice(1).filter(r => variantSkus.has(r[vVariantIdx]))];
+
+  const timestamp = Date.now();
+  downloadCsvRows(`costco_product_details_絞り込み_${timestamp}.csv`, filteredProducts);
+  downloadCsvRows(`costco_variants_full_絞り込み_${timestamp}.csv`, filteredVariants);
+
+  document.getElementById("extract-result").innerHTML = `
+    <p class="text-sm mt-2">抽出完了: 商品 ${filteredProducts.length - 1}件 / バリエーション ${filteredVariants.length - 1}件 をダウンロードしました</p>
+  `;
+}
+
+function renderExtractPage() {
+  app.innerHTML = `
+    ${navBarHtml()}
+    <h1 class="text-xl font-bold mb-4">元データ抽出ツール</h1>
+    <p class="text-sm opacity-70 mb-4">
+      商品一覧でダウンロードした「SKUリストCSV」をドロップすると、コストコの生CSVから
+      該当行だけを抽出したCSVがその場でダウンロードされます(Pythonを実行する必要はありません)。
+    </p>
+
+    <div class="border rounded-lg p-4 mb-4 bg-white/50">
+      <p class="text-sm font-medium mb-2">② ③ costco_product_details.csv / costco_variants_full.csv</p>
+      <button id="pick-folder" class="text-sm px-3 py-2 rounded bg-neutral-800 text-white mb-2">共有Driveのフォルダを選択(初回のみ)</button>
+      <div id="extract-auto-status" class="text-sm"></div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+      ${dropZoneHtml("sku-list-drop", "① SKUリストCSV")}
+      ${dropZoneHtml("product-details-drop", "②(自動読み込み失敗時のみ)costco_product_details.csv")}
+      ${dropZoneHtml("variants-full-drop", "③(自動読み込み失敗時のみ)costco_variants_full.csv")}
+    </div>
+    <button id="extract-run" class="bg-neutral-900 text-white px-4 py-2 rounded text-sm" disabled>3つのファイルを揃えてください</button>
+    <div id="extract-result"></div>
+  `;
+  setupDropZone("sku-list-drop", "skuList");
+  setupDropZone("product-details-drop", "productDetails");
+  setupDropZone("variants-full-drop", "variantsFull");
+  document.getElementById("extract-run").addEventListener("click", runExtract);
+  document.getElementById("pick-folder").addEventListener("click", pickCostcoFolder);
+
+  // 前回選んだフォルダが記憶されていれば自動読み込みを試みる
+  idbGet("costcoFolder").then(async (handle) => {
+    if (!handle) return;
+    const ok = await tryLoadFromFolder(handle);
+    renderExtractAutoStatus(ok);
+  }).catch(() => {});
 }
 
 const app = document.getElementById("app");
@@ -210,6 +445,8 @@ function handleRoute() {
     renderDetail(decodeURIComponent(hash.slice(5)));
   } else if (hash === "/keywords") {
     renderKeywordsPage();
+  } else if (hash === "/extract") {
+    renderExtractPage();
   } else {
     renderList();
   }
@@ -221,6 +458,7 @@ function navBarHtml() {
     <div class="flex gap-4 mb-4 text-sm">
       <a href="#/" class="text-blue-600 hover:underline">商品一覧</a>
       <a href="#/keywords" class="text-blue-600 hover:underline">除外キーワード管理</a>
+      <a href="#/extract" class="text-blue-600 hover:underline">元データ抽出ツール</a>
     </div>
   `;
 }
