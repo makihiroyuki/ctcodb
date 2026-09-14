@@ -22,7 +22,7 @@ const params = new URLSearchParams(location.search);
 const FILE_NAME = params.get("file") || "ctco_view.db.gz";
 
 // ステータス変更をスプレッドシートに直接送信するApps ScriptのURL(デプロイ後に設定)
-const APPS_SCRIPT_URL = "ここにApps ScriptのデプロイURLを貼り付け";
+const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzsPfCJ9ignmiv3m2xkAepijWPQpwt09MSMfh-V1BMTMEstq0iEHciko4iLMM1l9vxv/exec";
 
 const STATUS_STYLE = {
   "出品中": "bg-white border border-neutral-300 text-neutral-900",
@@ -580,7 +580,7 @@ function setupInfiniteScroll() {
   window._ctcoScrollHandlerAttached = true;
   window.addEventListener("scroll", debounce(() => {
     if (!location.hash || location.hash === "#/" || location.hash === "") {
-      const nearBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 400;
+      const nearBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 400;a
       if (nearBottom && VISIBLE_COUNT < CACHED_FILTERED_ROWS.length) {
         VISIBLE_COUNT += 60;
         renderList(true);
@@ -592,10 +592,13 @@ function setupInfiniteScroll() {
 async function submitPendingStatusChanges() {
   const btn = document.getElementById("pending-submit");
   const pending = getPendingStatus();
-  const changes = Object.entries(pending).map(([sku, v]) => ({ sku, override: v.override, reason: v.reason || "" }));
+  const STATUS_JA = { exclude: "除外", allow: "未出品(出品可)" };
+  const changes = Object.entries(pending).map(([sku, v]) => ({
+    sku, field: "status", value: STATUS_JA[v.override] || v.override, reason: v.reason || "",
+  }));
   if (changes.length === 0) return;
 
-  if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.includes("https://script.google.com/macros/s/AKfycbwmyLQgEqu6yvbRFdzc-Hq1Hj2qXTYfHDBfkJLteWVM-p-3t-CPZN71iqBsyBbet2Qqrw/exec")) {
+  if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.includes("ここに")) {
     alert("Apps ScriptのURLがまだ設定されていません(index.html内のAPPS_SCRIPT_URL)。先にCSVでバックアップしてください。");
     return;
   }
@@ -729,6 +732,10 @@ function renderDetail(variantSku) {
           </table>
           <p class="text-xs mt-2 opacity-50">計算式: (仕入値 + 送料 + 粗利) ÷ 0.9(切り上げ)</p>
           ` : `<p class="text-sm opacity-70">この品番の送料・粗利データがありません</p>`}
+          <div class="flex gap-2 mt-3">
+            <button id="edit-shipping" class="text-xs px-3 py-1.5 rounded bg-black/10">送料を編集</button>
+            <button id="edit-margin" class="text-xs px-3 py-1.5 rounded bg-black/10">粗利を編集</button>
+          </div>
         </div>
       </div>
 
@@ -739,6 +746,37 @@ function renderDetail(variantSku) {
       </div>` : ""}
     </div>
   `;
+
+  const shipBtn = document.getElementById("edit-shipping");
+  if (shipBtn) shipBtn.addEventListener("click", () => editShippingOrMargin(r, "shipping"));
+  const marginBtn = document.getElementById("edit-margin");
+  if (marginBtn) marginBtn.addEventListener("click", () => editShippingOrMargin(r, "margin"));
+}
+
+async function editShippingOrMargin(r, field) {
+  const label = field === "shipping" ? "送料" : "粗利";
+  const current = field === "shipping" ? r.shipping_cost : r.margin;
+  const input = prompt(`${label}の新しい値を入力してください(円)`, current ?? "");
+  if (input === null || input.trim() === "") return;
+  const value = Number(input);
+  if (!Number.isFinite(value)) { alert("数値を入力してください"); return; }
+
+  if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.includes("ここに")) {
+    alert("Apps ScriptのURLがまだ設定されていません(index.html内のAPPS_SCRIPT_URL)。");
+    return;
+  }
+  try {
+    const res = await fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      body: JSON.stringify([{ sku: r.variant_sku, field, value }]),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || "unknown error");
+    alert(`${label}を${value}円で送信しました。次回のデータ反映で自動的に反映されます。`);
+  } catch (e) {
+    console.error(e);
+    alert(`送信に失敗しました: ${e.message}`);
+  }
 }
 
 function renderKeywordsPage() {
